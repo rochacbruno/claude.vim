@@ -66,6 +66,9 @@ function! s:SetupClaudeKeybindings()
   execute "nnoremap " . g:claude_map_cancel_response . " :ClaudeCancel<CR>"
 endfunction
 
+" Define ClaudeDebug command outside of autocmd so it's always available
+command! ClaudeDebug call s:OpenDebugBuffer()
+
 augroup ClaudeKeybindings
   autocmd!
   autocmd VimEnter * call s:SetupClaudeKeybindings()
@@ -96,6 +99,13 @@ endif
 " ============================================================================
 
 function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, final_callback)
+  " Show status message
+  echom "Claude: Preparing CLI request..."
+  redraw
+  
+  " Debug log
+  call s:DebugLog("Starting CLI query with " . len(a:messages) . " messages")
+  
   " Build the prompt for Claude CLI
   let l:full_prompt = ""
   
@@ -137,8 +147,22 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
   " Add instruction for assistant to respond
   let l:full_prompt .= "Assistant: "
   
-  " Prepare the command for Claude CLI
-  let l:cmd = [g:claude_code_cli, '-p', l:full_prompt, '--output-format', 'json']
+  " Debug log the prompt
+  call s:DebugLog("CLI Prompt length: " . len(l:full_prompt) . " characters")
+  
+  " Prepare the command for Claude CLI - simpler format
+  let l:cmd = [g:claude_code_cli, l:full_prompt]
+  
+  " Debug log the command
+  call s:DebugLog("CLI Command: " . join(l:cmd, ' '))
+  
+  " Show status
+  echom "Claude: Calling CLI..."
+  redraw
+  
+  " Initialize buffer for accumulating output
+  let s:cli_output_buffer = ''
+  let s:cli_response_started = 0
   
   " Start the job
   if has('nvim')
@@ -147,12 +171,28 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
       \ 'on_stderr': function('s:HandleCLIErrorNvim', [a:stream_callback, a:final_callback]),
       \ 'on_exit': function('s:HandleCLIExitNvim', [a:stream_callback, a:final_callback])
       \ })
+    if l:job <= 0
+      call s:DebugLog("ERROR: Failed to start CLI job (nvim): " . l:job)
+      echohl ErrorMsg
+      echom "Claude: Failed to start CLI process"
+      echohl None
+    else
+      call s:DebugLog("Started CLI job (nvim): " . l:job)
+    endif
   else
     let l:job = job_start(l:cmd, {
       \ 'out_cb': function('s:HandleCLIOutput', [a:stream_callback, a:final_callback]),
       \ 'err_cb': function('s:HandleCLIError', [a:stream_callback, a:final_callback]),
       \ 'exit_cb': function('s:HandleCLIExit', [a:stream_callback, a:final_callback])
       \ })
+    if job_status(l:job) == 'fail'
+      call s:DebugLog("ERROR: Failed to start CLI job (vim)")
+      echohl ErrorMsg
+      echom "Claude: Failed to start CLI process"
+      echohl None
+    else
+      call s:DebugLog("Started CLI job (vim): " . string(l:job))
+    endif
   endif
   
   return l:job
@@ -166,6 +206,7 @@ function! s:ClaudeQueryInternal(messages, system_prompt, tools, stream_callback,
 
   " Check if we should use Claude Code CLI
   if !empty(g:claude_code_cli) && executable(g:claude_code_cli)
+    call s:DebugLog("Using Claude Code CLI at: " . g:claude_code_cli)
     return s:ClaudeQueryViaCLI(a:messages, a:system_prompt, a:tools, a:stream_callback, a:final_callback)
   elseif g:claude_use_bedrock
     let l:python_script = s:plugin_dir . '/claude_bedrock_helper.py'
@@ -246,57 +287,69 @@ function! s:DisplayTokenUsageAndCost(json_data)
 endfunction
 
 function! s:HandleCLIOutput(stream_callback, final_callback, channel, msg)
-  " Buffer for accumulating JSON response
+  " Buffer for accumulating response
   if !exists('s:cli_output_buffer')
     let s:cli_output_buffer = ''
   endif
   
+  " Show first response received
+  if !exists('s:cli_response_started') || !s:cli_response_started
+    let s:cli_response_started = 1
+    echom "Claude: Receiving response..."
+    redraw
+  endif
+  
+  call s:DebugLog("CLI stdout: " . a:msg)
+  
+  " Accumulate output and try to stream it
   let s:cli_output_buffer .= a:msg
+  
+  " Stream the text directly as it comes
+  call a:stream_callback(a:msg)
 endfunction
 
 function! s:HandleCLIError(stream_callback, final_callback, channel, msg)
-  " Ignore stderr output from CLI unless it's an actual error
-  " The CLI might output progress info to stderr
-  if a:msg =~ 'error' || a:msg =~ 'Error'
+  call s:DebugLog("CLI stderr: " . a:msg)
+  
+  " Check for actual errors
+  if a:msg =~ 'error' || a:msg =~ 'Error' || a:msg =~ 'ERROR'
+    echohl ErrorMsg
+    echom "Claude CLI Error: " . a:msg
+    echohl None
     call a:stream_callback('Error: ' . a:msg)
+  elseif a:msg != ''
+    " Log non-error stderr messages for debugging
+    call s:DebugLog("CLI stderr (non-error): " . a:msg)
   endif
 endfunction
 
 function! s:HandleCLIExit(stream_callback, final_callback, job, status)
-  if a:status == 0 && exists('s:cli_output_buffer')
-    " Parse the JSON response
-    try
-      let l:response = json_decode(s:cli_output_buffer)
-      
-      " Extract the text content from the response
-      if has_key(l:response, 'content')
-        if type(l:response.content) == v:t_list
-          for item in l:response.content
-            if type(item) == v:t_dict && has_key(item, 'text')
-              call a:stream_callback(item.text)
-            elseif type(item) == v:t_string
-              call a:stream_callback(item)
-            endif
-          endfor
-        elseif type(l:response.content) == v:t_string
-          call a:stream_callback(l:response.content)
-        endif
-      elseif has_key(l:response, 'text')
-        call a:stream_callback(l:response.text)
-      elseif has_key(l:response, 'message')
-        call a:stream_callback(l:response.message)
-      else
-        " Fallback: just output the entire response as text
-        call a:stream_callback(s:cli_output_buffer)
-      endif
-    catch
-      " If JSON parsing fails, treat as plain text
-      call a:stream_callback(s:cli_output_buffer)
-    endtry
+  call s:DebugLog("CLI exited with status: " . a:status)
+  
+  if a:status == 0
+    echom "Claude: Response complete"
+    if exists('s:cli_output_buffer') && s:cli_output_buffer != ''
+      call s:DebugLog("Final CLI output buffer: " . s:cli_output_buffer)
+    endif
+  else
+    echohl ErrorMsg
+    echom "Claude: CLI exited with error status " . a:status
+    echohl None
     
+    if exists('s:cli_output_buffer')
+      call s:DebugLog("CLI output on error: " . s:cli_output_buffer)
+      call a:stream_callback('Error: Claude CLI failed. Check :ClaudeDebug for details')
+    else
+      call a:stream_callback('Error: Claude CLI exited with status ' . a:status)
+    endif
+  endif
+  
+  " Clean up
+  if exists('s:cli_output_buffer')
     unlet s:cli_output_buffer
-  elseif a:status != 0
-    call a:stream_callback('Error: Claude CLI exited with status ' . a:status)
+  endif
+  if exists('s:cli_response_started')
+    unlet s:cli_response_started  
   endif
   
   call a:final_callback()
@@ -1308,6 +1361,86 @@ function! s:FinalChatResponse()
     call win_gotoid(l:current_winid)
     unlet! s:current_chat_job
   endif
+endfunction
+
+" ============================================================================
+" Debug Buffer
+" ============================================================================
+
+if !exists('s:debug_log')
+  let s:debug_log = []
+endif
+
+function! s:DebugLog(msg)
+  " Add timestamp to debug message
+  let l:timestamp = strftime('%H:%M:%S')
+  let l:msg = '[' . l:timestamp . '] ' . a:msg
+  call add(s:debug_log, l:msg)
+  
+  " Keep only last 1000 lines
+  if len(s:debug_log) > 1000
+    let s:debug_log = s:debug_log[-1000:]
+  endif
+endfunction
+
+function! s:OpenDebugBuffer()
+  " Check if debug buffer already exists
+  let l:debug_bufnr = bufnr('Claude Debug')
+  
+  if l:debug_bufnr != -1 && bufloaded(l:debug_bufnr)
+    " Switch to existing buffer
+    let l:debug_winid = bufwinid(l:debug_bufnr)
+    if l:debug_winid != -1
+      call win_gotoid(l:debug_winid)
+    else
+      execute 'split'
+      execute 'buffer' l:debug_bufnr
+    endif
+  else
+    " Create new debug buffer
+    execute 'split Claude Debug'
+    setlocal buftype=nofile
+    setlocal bufhidden=hide  
+    setlocal noswapfile
+    setlocal nowrap
+    setlocal autoread
+  endif
+  
+  " Clear and populate with debug info
+  normal! ggdG
+  
+  call append(0, ['=== Claude.vim Debug Information ===', ''])
+  call append('$', '--- Configuration ---')
+  call append('$', 'claude_code_cli: ' . g:claude_code_cli)
+  call append('$', 'CLI executable: ' . (executable(g:claude_code_cli) ? 'Yes' : 'No'))
+  call append('$', 'claude_use_bedrock: ' . g:claude_use_bedrock)
+  call append('$', 'claude_model: ' . g:claude_model)
+  call append('$', 'API key set: ' . (!empty(g:claude_api_key) ? 'Yes' : 'No'))
+  call append('$', '')
+  
+  " Test CLI if configured
+  if !empty(g:claude_code_cli) && executable(g:claude_code_cli)
+    call append('$', '--- CLI Test ---')
+    call append('$', 'Testing CLI with: ' . g:claude_code_cli . ' --version')
+    let l:cli_test = system(g:claude_code_cli . ' --version 2>&1')
+    call append('$', 'CLI version output: ' . l:cli_test)
+    call append('$', '')
+  endif
+  
+  call append('$', '--- Debug Log ---')
+  if !empty(s:debug_log)
+    call append('$', s:debug_log)
+  else
+    call append('$', 'No debug messages yet')
+  endif
+  
+  " Go to end of buffer
+  normal! G
+  
+  echom "Debug buffer opened. Press 'q' to close."
+  
+  " Add mapping to close with 'q'
+  nnoremap <buffer> q :close<CR>
 endfunction
 
 function! s:CancelClaudeResponse()
