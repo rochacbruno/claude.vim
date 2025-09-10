@@ -106,55 +106,33 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
   " Debug log
   call s:DebugLog("Starting CLI query with " . len(a:messages) . " messages")
   
-  " Build the prompt for Claude CLI
+  " Build the prompt for Claude CLI - just use the last user message
   let l:full_prompt = ""
   
-  " Add system prompt if provided
-  if !empty(a:system_prompt)
-    let l:full_prompt .= "System: " . a:system_prompt . "\n\n"
-  endif
-  
-  " Build conversation from messages
-  for msg in a:messages
-    if msg.role == 'user'
-      let l:full_prompt .= "User: "
-    elseif msg.role == 'assistant'
-      let l:full_prompt .= "Assistant: "
-    endif
-    
-    " Handle content that could be string or list
-    if type(msg.content) == v:t_string
-      let l:full_prompt .= msg.content
-    elseif type(msg.content) == v:t_list
-      " Handle tool use messages
-      for content_item in msg.content
-        if type(content_item) == v:t_dict
-          if content_item.type == 'text'
-            let l:full_prompt .= content_item.text
-          elseif content_item.type == 'tool_use'
-            let l:full_prompt .= "\n[Tool use: " . content_item.name . " with input: " . json_encode(content_item.input) . "]"
-          elseif content_item.type == 'tool_result'
-            let l:full_prompt .= "\n[Tool result: " . content_item.content . "]"
-          endif
-        else
-          let l:full_prompt .= string(content_item)
+  " Get the last user message
+  if len(a:messages) > 0
+    let l:last_msg = a:messages[-1]
+    if type(l:last_msg.content) == v:t_string
+      let l:full_prompt = l:last_msg.content
+    elseif type(l:last_msg.content) == v:t_list
+      " Extract text from complex content
+      for content_item in l:last_msg.content
+        if type(content_item) == v:t_dict && content_item.type == 'text'
+          let l:full_prompt .= content_item.text
         endif
       endfor
     endif
-    let l:full_prompt .= "\n\n"
-  endfor
-  
-  " Add instruction for assistant to respond
-  let l:full_prompt .= "Assistant: "
+  endif
   
   " Debug log the prompt
+  call s:DebugLog("CLI Prompt: " . strpart(l:full_prompt, 0, 200) . "...")
   call s:DebugLog("CLI Prompt length: " . len(l:full_prompt) . " characters")
   
-  " Prepare the command for Claude CLI - simpler format
-  let l:cmd = [g:claude_code_cli, l:full_prompt]
+  " Prepare the command for Claude CLI with proper flags
+  let l:cmd = [g:claude_code_cli, '-p', l:full_prompt, '--output-format', 'json']
   
   " Debug log the command
-  call s:DebugLog("CLI Command: " . join(l:cmd, ' '))
+  call s:DebugLog("CLI Command: " . g:claude_code_cli . " -p '...' --output-format json")
   
   " Show status
   echom "Claude: Calling CLI..."
@@ -169,13 +147,15 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
     let l:job = jobstart(l:cmd, {
       \ 'on_stdout': function('s:HandleCLIOutputNvim', [a:stream_callback, a:final_callback]),
       \ 'on_stderr': function('s:HandleCLIErrorNvim', [a:stream_callback, a:final_callback]),
-      \ 'on_exit': function('s:HandleCLIExitNvim', [a:stream_callback, a:final_callback])
+      \ 'on_exit': function('s:HandleCLIExitNvim', [a:stream_callback, a:final_callback]),
+      \ 'stdout_buffered': v:true
       \ })
     if l:job <= 0
       call s:DebugLog("ERROR: Failed to start CLI job (nvim): " . l:job)
       echohl ErrorMsg
-      echom "Claude: Failed to start CLI process"
+      echom "Claude: Failed to start CLI process. Check path: " . g:claude_code_cli
       echohl None
+      call a:final_callback()
     else
       call s:DebugLog("Started CLI job (nvim): " . l:job)
     endif
@@ -183,13 +163,15 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
     let l:job = job_start(l:cmd, {
       \ 'out_cb': function('s:HandleCLIOutput', [a:stream_callback, a:final_callback]),
       \ 'err_cb': function('s:HandleCLIError', [a:stream_callback, a:final_callback]),
-      \ 'exit_cb': function('s:HandleCLIExit', [a:stream_callback, a:final_callback])
+      \ 'exit_cb': function('s:HandleCLIExit', [a:stream_callback, a:final_callback]),
+      \ 'out_mode': 'raw'
       \ })
     if job_status(l:job) == 'fail'
       call s:DebugLog("ERROR: Failed to start CLI job (vim)")
       echohl ErrorMsg
-      echom "Claude: Failed to start CLI process"
+      echom "Claude: Failed to start CLI process. Check path: " . g:claude_code_cli
       echohl None
+      call a:final_callback()
     else
       call s:DebugLog("Started CLI job (vim): " . string(l:job))
     endif
@@ -287,7 +269,7 @@ function! s:DisplayTokenUsageAndCost(json_data)
 endfunction
 
 function! s:HandleCLIOutput(stream_callback, final_callback, channel, msg)
-  " Buffer for accumulating response
+  " Buffer for accumulating JSON response
   if !exists('s:cli_output_buffer')
     let s:cli_output_buffer = ''
   endif
@@ -299,13 +281,10 @@ function! s:HandleCLIOutput(stream_callback, final_callback, channel, msg)
     redraw
   endif
   
-  call s:DebugLog("CLI stdout: " . a:msg)
+  call s:DebugLog("CLI stdout received: " . len(a:msg) . " bytes")
   
-  " Accumulate output and try to stream it
+  " Accumulate JSON output (don't stream until we have complete JSON)
   let s:cli_output_buffer .= a:msg
-  
-  " Stream the text directly as it comes
-  call a:stream_callback(a:msg)
 endfunction
 
 function! s:HandleCLIError(stream_callback, final_callback, channel, msg)
@@ -326,22 +305,75 @@ endfunction
 function! s:HandleCLIExit(stream_callback, final_callback, job, status)
   call s:DebugLog("CLI exited with status: " . a:status)
   
-  if a:status == 0
-    echom "Claude: Response complete"
-    if exists('s:cli_output_buffer') && s:cli_output_buffer != ''
-      call s:DebugLog("Final CLI output buffer: " . s:cli_output_buffer)
-    endif
-  else
+  if a:status == 0 && exists('s:cli_output_buffer') && s:cli_output_buffer != ''
+    " Parse the JSON response
+    try
+      call s:DebugLog("Parsing CLI JSON output: " . strpart(s:cli_output_buffer, 0, 500) . "...")
+      let l:response = json_decode(s:cli_output_buffer)
+      
+      " Check if it's an error response
+      if has_key(l:response, 'is_error') && l:response.is_error
+        echohl ErrorMsg
+        echom "Claude CLI Error: " . get(l:response, 'error', 'Unknown error')
+        echohl None
+        call a:stream_callback('Error: ' . get(l:response, 'error', 'CLI returned an error'))
+      elseif has_key(l:response, 'result')
+        " Success! Extract the result text
+        echom "Claude: Response complete"
+        call s:DebugLog("CLI returned result: " . strpart(l:response.result, 0, 200) . "...")
+        call a:stream_callback(l:response.result)
+      else
+        " Unexpected JSON structure
+        call s:DebugLog("WARNING: Unexpected JSON structure: " . string(keys(l:response)))
+        echohl WarningMsg
+        echom "Claude: Unexpected response format"
+        echohl None
+        " Try to extract any text we can find
+        if has_key(l:response, 'message')
+          call a:stream_callback(l:response.message)
+        elseif has_key(l:response, 'text')
+          call a:stream_callback(l:response.text)
+        else
+          call a:stream_callback('Unexpected response format. Check :ClaudeDebug')
+        endif
+      endif
+    catch
+      " JSON parsing failed
+      call s:DebugLog("ERROR: Failed to parse JSON: " . v:exception)
+      call s:DebugLog("Raw output: " . s:cli_output_buffer)
+      echohl ErrorMsg
+      echom "Claude: Failed to parse CLI response"
+      echohl None
+      call a:stream_callback('Error: Failed to parse CLI response. Check :ClaudeDebug')
+    endtry
+  elseif a:status != 0
     echohl ErrorMsg
     echom "Claude: CLI exited with error status " . a:status
     echohl None
     
-    if exists('s:cli_output_buffer')
+    if exists('s:cli_output_buffer') && s:cli_output_buffer != ''
       call s:DebugLog("CLI output on error: " . s:cli_output_buffer)
-      call a:stream_callback('Error: Claude CLI failed. Check :ClaudeDebug for details')
+      " Try to parse error JSON
+      try
+        let l:error_response = json_decode(s:cli_output_buffer)
+        if has_key(l:error_response, 'error')
+          call a:stream_callback('Error: ' . l:error_response.error)
+        else
+          call a:stream_callback('Error: Claude CLI failed. Check :ClaudeDebug for details')
+        endif
+      catch
+        call a:stream_callback('Error: Claude CLI failed. Check :ClaudeDebug for details')
+      endtry
     else
       call a:stream_callback('Error: Claude CLI exited with status ' . a:status)
     endif
+  else
+    " No output received
+    call s:DebugLog("WARNING: CLI exited with no output")
+    echohl WarningMsg
+    echom "Claude: No response received from CLI"
+    echohl None
+    call a:stream_callback('No response received from CLI')
   endif
   
   " Clean up
@@ -356,11 +388,11 @@ function! s:HandleCLIExit(stream_callback, final_callback, job, status)
 endfunction
 
 function! s:HandleCLIOutputNvim(stream_callback, final_callback, job_id, data, event) dict
-  for l:msg in a:data
-    if l:msg != ''
-      call s:HandleCLIOutput(a:stream_callback, a:final_callback, 0, l:msg)
-    endif
-  endfor
+  " In nvim, data is an array of lines, join them
+  let l:output = join(a:data, "\n")
+  if l:output != ''
+    call s:HandleCLIOutput(a:stream_callback, a:final_callback, 0, l:output)
+  endif
 endfunction
 
 function! s:HandleCLIErrorNvim(stream_callback, final_callback, job_id, data, event) dict
