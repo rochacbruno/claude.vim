@@ -30,6 +30,10 @@ if !exists('g:claude_aws_profile')
   let g:claude_aws_profile = ''
 endif
 
+if !exists('g:claude_code_cli')
+  let g:claude_code_cli = ''
+endif
+
 if !exists('g:claude_map_implement')
   let g:claude_map_implement = '<leader>ci'
 endif
@@ -91,13 +95,79 @@ endif
 " Claude API
 " ============================================================================
 
+function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, final_callback)
+  " Build the prompt for Claude CLI
+  let l:full_prompt = ""
+  
+  " Add system prompt if provided
+  if !empty(a:system_prompt)
+    let l:full_prompt .= "System: " . a:system_prompt . "\n\n"
+  endif
+  
+  " Build conversation from messages
+  for msg in a:messages
+    if msg.role == 'user'
+      let l:full_prompt .= "User: "
+    elseif msg.role == 'assistant'
+      let l:full_prompt .= "Assistant: "
+    endif
+    
+    " Handle content that could be string or list
+    if type(msg.content) == v:t_string
+      let l:full_prompt .= msg.content
+    elseif type(msg.content) == v:t_list
+      " Handle tool use messages
+      for content_item in msg.content
+        if type(content_item) == v:t_dict
+          if content_item.type == 'text'
+            let l:full_prompt .= content_item.text
+          elseif content_item.type == 'tool_use'
+            let l:full_prompt .= "\n[Tool use: " . content_item.name . " with input: " . json_encode(content_item.input) . "]"
+          elseif content_item.type == 'tool_result'
+            let l:full_prompt .= "\n[Tool result: " . content_item.content . "]"
+          endif
+        else
+          let l:full_prompt .= string(content_item)
+        endif
+      endfor
+    endif
+    let l:full_prompt .= "\n\n"
+  endfor
+  
+  " Add instruction for assistant to respond
+  let l:full_prompt .= "Assistant: "
+  
+  " Prepare the command for Claude CLI
+  let l:cmd = [g:claude_code_cli, '-p', l:full_prompt, '--output-format', 'json']
+  
+  " Start the job
+  if has('nvim')
+    let l:job = jobstart(l:cmd, {
+      \ 'on_stdout': function('s:HandleCLIOutputNvim', [a:stream_callback, a:final_callback]),
+      \ 'on_stderr': function('s:HandleCLIErrorNvim', [a:stream_callback, a:final_callback]),
+      \ 'on_exit': function('s:HandleCLIExitNvim', [a:stream_callback, a:final_callback])
+      \ })
+  else
+    let l:job = job_start(l:cmd, {
+      \ 'out_cb': function('s:HandleCLIOutput', [a:stream_callback, a:final_callback]),
+      \ 'err_cb': function('s:HandleCLIError', [a:stream_callback, a:final_callback]),
+      \ 'exit_cb': function('s:HandleCLIExit', [a:stream_callback, a:final_callback])
+      \ })
+  endif
+  
+  return l:job
+endfunction
+
 function! s:ClaudeQueryInternal(messages, system_prompt, tools, stream_callback, final_callback)
   " Prepare the API request
   let l:data = {}
   let l:headers = []
   let l:url = ''
 
-  if g:claude_use_bedrock
+  " Check if we should use Claude Code CLI
+  if !empty(g:claude_code_cli) && executable(g:claude_code_cli)
+    return s:ClaudeQueryViaCLI(a:messages, a:system_prompt, a:tools, a:stream_callback, a:final_callback)
+  elseif g:claude_use_bedrock
     let l:python_script = s:plugin_dir . '/claude_bedrock_helper.py'
     let l:cmd = ['python3', l:python_script,
           \ '--region', g:claude_bedrock_region,
@@ -173,6 +243,83 @@ function! s:DisplayTokenUsageAndCost(json_data)
   else
     echom "Error: Invalid JSON data format"
   endif
+endfunction
+
+function! s:HandleCLIOutput(stream_callback, final_callback, channel, msg)
+  " Buffer for accumulating JSON response
+  if !exists('s:cli_output_buffer')
+    let s:cli_output_buffer = ''
+  endif
+  
+  let s:cli_output_buffer .= a:msg
+endfunction
+
+function! s:HandleCLIError(stream_callback, final_callback, channel, msg)
+  " Ignore stderr output from CLI unless it's an actual error
+  " The CLI might output progress info to stderr
+  if a:msg =~ 'error' || a:msg =~ 'Error'
+    call a:stream_callback('Error: ' . a:msg)
+  endif
+endfunction
+
+function! s:HandleCLIExit(stream_callback, final_callback, job, status)
+  if a:status == 0 && exists('s:cli_output_buffer')
+    " Parse the JSON response
+    try
+      let l:response = json_decode(s:cli_output_buffer)
+      
+      " Extract the text content from the response
+      if has_key(l:response, 'content')
+        if type(l:response.content) == v:t_list
+          for item in l:response.content
+            if type(item) == v:t_dict && has_key(item, 'text')
+              call a:stream_callback(item.text)
+            elseif type(item) == v:t_string
+              call a:stream_callback(item)
+            endif
+          endfor
+        elseif type(l:response.content) == v:t_string
+          call a:stream_callback(l:response.content)
+        endif
+      elseif has_key(l:response, 'text')
+        call a:stream_callback(l:response.text)
+      elseif has_key(l:response, 'message')
+        call a:stream_callback(l:response.message)
+      else
+        " Fallback: just output the entire response as text
+        call a:stream_callback(s:cli_output_buffer)
+      endif
+    catch
+      " If JSON parsing fails, treat as plain text
+      call a:stream_callback(s:cli_output_buffer)
+    endtry
+    
+    unlet s:cli_output_buffer
+  elseif a:status != 0
+    call a:stream_callback('Error: Claude CLI exited with status ' . a:status)
+  endif
+  
+  call a:final_callback()
+endfunction
+
+function! s:HandleCLIOutputNvim(stream_callback, final_callback, job_id, data, event) dict
+  for l:msg in a:data
+    if l:msg != ''
+      call s:HandleCLIOutput(a:stream_callback, a:final_callback, 0, l:msg)
+    endif
+  endfor
+endfunction
+
+function! s:HandleCLIErrorNvim(stream_callback, final_callback, job_id, data, event) dict
+  for l:msg in a:data
+    if l:msg != ''
+      call s:HandleCLIError(a:stream_callback, a:final_callback, 0, l:msg)
+    endif
+  endfor
+endfunction
+
+function! s:HandleCLIExitNvim(stream_callback, final_callback, job_id, exit_code, event) dict
+  call s:HandleCLIExit(a:stream_callback, a:final_callback, 0, a:exit_code)
 endfunction
 
 function! s:HandleStreamOutput(stream_callback, final_callback, channel, msg)

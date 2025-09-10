@@ -110,6 +110,18 @@ let g:claude_api_key = 'your_api_key_here'
 
 (You can also use AWS Bedrock as your Claude provider instead - in that case, set `let g:claude_use_bedrock = 1` instead.)
 
+### Using Claude Code CLI (No API Key Required)
+
+If you have the Claude Code CLI installed locally, you can use it instead of the API. This allows you to use the plugin without needing an API key:
+
+```vim
+let g:claude_code_cli = '/path/to/claude'  " e.g., '~/.claude/local/claude'
+```
+
+When `g:claude_code_cli` is set to a valid executable path, the plugin will use the CLI instead of the API. If the CLI is not found or not set, the plugin will fall back to using the API as normal.
+
+**Note:** The CLI must support the `--output-format json` flag for proper integration.
+
 You can edit the keybindings as follows:
 
 ```vim
