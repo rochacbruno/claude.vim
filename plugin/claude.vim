@@ -157,6 +157,11 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
   " Use json format for simplicity - streaming requires --verbose
   let l:cmd = [g:claude_code_cli, '-p', l:full_prompt, '--output-format', 'json']
   
+  " Add system prompt if provided
+  if !empty(a:system_prompt)
+    call extend(l:cmd, ['--append-system-prompt', a:system_prompt])
+  endif
+  
   " Debug log the command
   call s:DebugLog("CLI Command: " . join(l:cmd, ' '))
   call s:DebugLog("CLI Executable exists: " . executable(g:claude_code_cli))
