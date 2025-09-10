@@ -31,7 +31,16 @@ if !exists('g:claude_aws_profile')
 endif
 
 if !exists('g:claude_code_cli')
-  let g:claude_code_cli = ''
+  " Support both variable names for backwards compatibility
+  if exists('g:claude_cli_path')
+    let g:claude_code_cli = g:claude_cli_path
+  else
+    let g:claude_code_cli = ''
+  endif
+endif
+
+if !exists('g:claude_verbose')
+  let g:claude_verbose = 0
 endif
 
 if !exists('g:claude_map_implement')
@@ -100,7 +109,9 @@ endif
 
 function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, final_callback)
   " Show status message
-  echom "Claude: Preparing CLI request..."
+  if g:claude_verbose
+    echom "Claude: Preparing CLI request..."
+  endif
   redraw
   
   " Debug log
@@ -128,19 +139,45 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
   call s:DebugLog("CLI Prompt: " . strpart(l:full_prompt, 0, 200) . "...")
   call s:DebugLog("CLI Prompt length: " . len(l:full_prompt) . " characters")
   
+  if g:claude_verbose
+    echom "Claude: Prompt length: " . len(l:full_prompt) . " chars"
+  endif
+  
+  " Check for empty prompt
+  if empty(l:full_prompt)
+    echohl ErrorMsg
+    echom "Claude: ERROR - Empty prompt! Type your message after 'You: ' on the same line."
+    echohl None
+    call s:DebugLog("ERROR: Empty prompt - no message to send")
+    call a:final_callback()
+    return 0
+  endif
+  
   " Prepare the command for Claude CLI with proper flags
+  " Use json format for simplicity - streaming requires --verbose
   let l:cmd = [g:claude_code_cli, '-p', l:full_prompt, '--output-format', 'json']
   
   " Debug log the command
-  call s:DebugLog("CLI Command: " . g:claude_code_cli . " -p '...' --output-format json")
+  call s:DebugLog("CLI Command: " . join(l:cmd, ' '))
+  call s:DebugLog("CLI Executable exists: " . executable(g:claude_code_cli))
+  
+  if g:claude_verbose
+    echom "Claude: Running: " . g:claude_code_cli
+  endif
   
   " Show status
-  echom "Claude: Calling CLI..."
+  if g:claude_verbose
+    echom "Claude: Calling CLI..."
+  endif
   redraw
   
-  " Initialize buffer for accumulating output
-  let s:cli_output_buffer = ''
+  " Initialize state variables
   let s:cli_response_started = 0
+  let s:cli_start_time = localtime()
+  let s:cli_job_active = 1
+  
+  " Set up a timer to check for timeout
+  let s:cli_timeout_timer = timer_start(30000, function('s:CheckCLITimeout', [a:stream_callback, a:final_callback]))
   
   " Start the job
   if has('nvim')
@@ -158,15 +195,27 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
       call a:final_callback()
     else
       call s:DebugLog("Started CLI job (nvim): " . l:job)
+      if g:claude_verbose
+        echom "Claude: Started CLI job #" . l:job
+      endif
+      
+      " Close stdin immediately to prevent hanging
+      call chanclose(l:job, 'stdin')
+      call s:DebugLog("Closed stdin for CLI job (nvim)")
     endif
   else
     let l:job = job_start(l:cmd, {
       \ 'out_cb': function('s:HandleCLIOutput', [a:stream_callback, a:final_callback]),
       \ 'err_cb': function('s:HandleCLIError', [a:stream_callback, a:final_callback]),
       \ 'exit_cb': function('s:HandleCLIExit', [a:stream_callback, a:final_callback]),
-      \ 'out_mode': 'raw'
+      \ 'out_mode': 'nl',
+      \ 'err_mode': 'nl',
+      \ 'in_mode': 'nl'
       \ })
-    if job_status(l:job) == 'fail'
+    let l:job_status = job_status(l:job)
+    call s:DebugLog("Job status after start: " . l:job_status)
+    
+    if l:job_status == 'fail'
       call s:DebugLog("ERROR: Failed to start CLI job (vim)")
       echohl ErrorMsg
       echom "Claude: Failed to start CLI process. Check path: " . g:claude_code_cli
@@ -174,6 +223,19 @@ function! s:ClaudeQueryViaCLI(messages, system_prompt, tools, stream_callback, f
       call a:final_callback()
     else
       call s:DebugLog("Started CLI job (vim): " . string(l:job))
+      if g:claude_verbose
+        echom "Claude: Started CLI job (vim) - status: " . l:job_status
+      endif
+      
+      " Store job for monitoring
+      let s:current_cli_job = l:job
+      
+      " Close stdin immediately to prevent hanging
+      call ch_close_in(job_getchannel(l:job))
+      call s:DebugLog("Closed stdin for CLI job")
+      
+      " Set up periodic status check
+      let s:cli_status_timer = timer_start(1000, function('s:CheckCLIStatus'), {'repeat': 5})
     endif
   endif
   
@@ -274,21 +336,102 @@ function! s:HandleCLIOutput(stream_callback, final_callback, channel, msg)
     let s:cli_output_buffer = ''
   endif
   
+  " Cancel timeout timer on first output
+  if exists('s:cli_timeout_timer')
+    call timer_stop(s:cli_timeout_timer)
+    unlet s:cli_timeout_timer
+  endif
+  
   " Show first response received
   if !exists('s:cli_response_started') || !s:cli_response_started
     let s:cli_response_started = 1
-    echom "Claude: Receiving response..."
+    if g:claude_verbose
+      echom "Claude: Receiving response..."
+    endif
     redraw
   endif
   
   call s:DebugLog("CLI stdout received: " . len(a:msg) . " bytes")
   
-  " Accumulate JSON output (don't stream until we have complete JSON)
+  " Accumulate output
   let s:cli_output_buffer .= a:msg
+endfunction
+
+function! s:CheckCLITimeout(stream_callback, final_callback, timer_id)
+  if exists('s:cli_job_active') && s:cli_job_active
+    echohl ErrorMsg
+    echom "Claude: CLI timeout after 30 seconds. Check :ClaudeDebug for details."
+    echohl None
+    call s:DebugLog("ERROR: CLI timeout - no response after 30 seconds")
+    
+    " Try to stop the job
+    if exists('s:current_cli_job')
+      if has('nvim')
+        call jobstop(s:current_cli_job)
+      else
+        call job_stop(s:current_cli_job, 'kill')
+      endif
+      unlet s:current_cli_job
+    endif
+    
+    " Send timeout error through stream callback
+    call a:stream_callback('Error: CLI timeout after 30 seconds')
+    
+    " Clean up
+    if exists('s:cli_output_buffer')
+      call s:DebugLog("Partial output on timeout: " . strpart(s:cli_output_buffer, 0, 200))
+      unlet s:cli_output_buffer
+    endif
+    if exists('s:cli_response_started')
+      unlet s:cli_response_started
+    endif
+    if exists('s:cli_start_time')
+      unlet s:cli_start_time
+    endif
+    if exists('s:cli_status_timer')
+      call timer_stop(s:cli_status_timer)
+      unlet s:cli_status_timer
+    endif
+    let s:cli_job_active = 0
+    
+    " Call the final callback to complete the operation
+    call a:final_callback()
+  endif
+endfunction
+
+function! s:CheckCLIStatus(timer_id)
+  if exists('s:current_cli_job') && !has('nvim')
+    let l:status = job_status(s:current_cli_job)
+    call s:DebugLog("CLI job status check: " . l:status)
+    
+    if l:status == 'dead' || l:status == 'fail'
+      if exists('s:cli_job_active') && s:cli_job_active
+        call s:DebugLog("WARNING: CLI job died unexpectedly")
+        if g:claude_verbose
+          echohl WarningMsg
+          echom "Claude: CLI process ended unexpectedly"
+          echohl None
+        endif
+      endif
+      " Stop the timer
+      return 0
+    endif
+  endif
+  return 1
 endfunction
 
 function! s:HandleCLIError(stream_callback, final_callback, channel, msg)
   call s:DebugLog("CLI stderr: " . a:msg)
+  
+  " Cancel timeout timer on any stderr
+  if exists('s:cli_timeout_timer')
+    call timer_stop(s:cli_timeout_timer)
+    unlet s:cli_timeout_timer
+  endif
+  
+  if g:claude_verbose && a:msg != ''
+    echom "Claude stderr: " . strpart(a:msg, 0, 100)
+  endif
   
   " Check for actual errors
   if a:msg =~ 'error' || a:msg =~ 'Error' || a:msg =~ 'ERROR'
@@ -305,42 +448,47 @@ endfunction
 function! s:HandleCLIExit(stream_callback, final_callback, job, status)
   call s:DebugLog("CLI exited with status: " . a:status)
   
+  " Cancel timeout timer
+  if exists('s:cli_timeout_timer')
+    call timer_stop(s:cli_timeout_timer)
+    unlet s:cli_timeout_timer
+  endif
+  
+  let s:cli_job_active = 0
+  
+  if exists('s:cli_start_time')
+    let l:elapsed = localtime() - s:cli_start_time
+    call s:DebugLog("CLI execution time: " . l:elapsed . " seconds")
+    if g:claude_verbose
+      echom "Claude: CLI completed in " . l:elapsed . "s"
+    endif
+    unlet s:cli_start_time
+  endif
+  
+  " Parse the accumulated JSON output
   if a:status == 0 && exists('s:cli_output_buffer') && s:cli_output_buffer != ''
-    " Parse the JSON response
     try
-      call s:DebugLog("Parsing CLI JSON output: " . strpart(s:cli_output_buffer, 0, 500) . "...")
+      call s:DebugLog("Parsing CLI JSON output: " . strpart(s:cli_output_buffer, 0, 200) . "...")
       let l:response = json_decode(s:cli_output_buffer)
       
-      " Check if it's an error response
       if has_key(l:response, 'is_error') && l:response.is_error
         echohl ErrorMsg
         echom "Claude CLI Error: " . get(l:response, 'error', 'Unknown error')
         echohl None
         call a:stream_callback('Error: ' . get(l:response, 'error', 'CLI returned an error'))
       elseif has_key(l:response, 'result')
-        " Success! Extract the result text
-        echom "Claude: Response complete"
+        " Success! Send the complete result
+        if g:claude_verbose
+          echom "Claude: Response received"
+        endif
         call s:DebugLog("CLI returned result: " . strpart(l:response.result, 0, 200) . "...")
         call a:stream_callback(l:response.result)
       else
-        " Unexpected JSON structure
         call s:DebugLog("WARNING: Unexpected JSON structure: " . string(keys(l:response)))
-        echohl WarningMsg
-        echom "Claude: Unexpected response format"
-        echohl None
-        " Try to extract any text we can find
-        if has_key(l:response, 'message')
-          call a:stream_callback(l:response.message)
-        elseif has_key(l:response, 'text')
-          call a:stream_callback(l:response.text)
-        else
-          call a:stream_callback('Unexpected response format. Check :ClaudeDebug')
-        endif
+        call a:stream_callback('Unexpected response format. Check :ClaudeDebug')
       endif
     catch
-      " JSON parsing failed
       call s:DebugLog("ERROR: Failed to parse JSON: " . v:exception)
-      call s:DebugLog("Raw output: " . s:cli_output_buffer)
       echohl ErrorMsg
       echom "Claude: Failed to parse CLI response"
       echohl None
@@ -350,29 +498,9 @@ function! s:HandleCLIExit(stream_callback, final_callback, job, status)
     echohl ErrorMsg
     echom "Claude: CLI exited with error status " . a:status
     echohl None
-    
-    if exists('s:cli_output_buffer') && s:cli_output_buffer != ''
-      call s:DebugLog("CLI output on error: " . s:cli_output_buffer)
-      " Try to parse error JSON
-      try
-        let l:error_response = json_decode(s:cli_output_buffer)
-        if has_key(l:error_response, 'error')
-          call a:stream_callback('Error: ' . l:error_response.error)
-        else
-          call a:stream_callback('Error: Claude CLI failed. Check :ClaudeDebug for details')
-        endif
-      catch
-        call a:stream_callback('Error: Claude CLI failed. Check :ClaudeDebug for details')
-      endtry
-    else
-      call a:stream_callback('Error: Claude CLI exited with status ' . a:status)
-    endif
+    call a:stream_callback('Error: Claude CLI exited with status ' . a:status)
   else
-    " No output received
     call s:DebugLog("WARNING: CLI exited with no output")
-    echohl WarningMsg
-    echom "Claude: No response received from CLI"
-    echohl None
     call a:stream_callback('No response received from CLI')
   endif
   
@@ -382,6 +510,16 @@ function! s:HandleCLIExit(stream_callback, final_callback, job, status)
   endif
   if exists('s:cli_response_started')
     unlet s:cli_response_started  
+  endif
+  if exists('s:cli_start_time')
+    unlet s:cli_start_time
+  endif
+  if exists('s:current_cli_job')
+    unlet s:current_cli_job
+  endif
+  if exists('s:cli_status_timer')
+    call timer_stop(s:cli_status_timer)
+    unlet s:cli_status_timer
   endif
   
   call a:final_callback()
@@ -810,14 +948,29 @@ function! s:ClaudeImplement(line1, line2, instruction) range
   let l:bufnr = bufnr('%')
   let l:bufname = bufname('%')
   let l:winid = win_getid()
+  
+  " Initialize response variable
+  let s:implement_response = ""
 
-  " Prepare the prompt for code implementation
-  let l:prompt = "<code>\n" . l:selected_code . "\n</code>\n\n"
-  let l:prompt .= join(g:claude_implement_prompt, "\n")
+  " Debug logging
+  call s:DebugLog("ClaudeImplement: lines " . a:line1 . "-" . a:line2 . " in " . l:bufname)
+  call s:DebugLog("ClaudeImplement: instruction: " . a:instruction)
+  call s:DebugLog("ClaudeImplement: selected code length: " . len(l:selected_code))
 
+  " Prepare the system prompt for code implementation
+  let l:system_prompt = join(g:claude_implement_prompt, "\n")
+
+  " Prepare the user message with both instruction and code
+  let l:user_message = a:instruction . "\n\n<code>\n" . l:selected_code . "\n</code>"
+  
   " Query Claude
-  let l:messages = [{'role': 'user', 'content': a:instruction}]
-  call s:ClaudeQueryInternal(l:messages, l:prompt, [],
+  let l:messages = [{'role': 'user', 'content': l:user_message}]
+  
+  if g:claude_verbose
+    echom "Claude: Implementing code with instruction: " . strpart(a:instruction, 0, 50) . "..."
+  endif
+  
+  call s:ClaudeQueryInternal(l:messages, l:system_prompt, [],
         \ function('s:StreamingImplementResponse'),
         \ function('s:FinalImplementResponse', [a:line1, a:line2, l:bufnr, l:bufname, l:winid, a:instruction]))
 endfunction
@@ -845,20 +998,41 @@ function! s:StreamingImplementResponse(delta)
 endfunction
 
 function! s:FinalImplementResponse(line1, line2, bufnr, bufname, winid, instruction)
+  " Check if we have a response
+  if !exists('s:implement_response')
+    echohl ErrorMsg
+    echom "Claude: No response received for implementation"
+    echohl None
+    return
+  endif
+  
+  if empty(s:implement_response)
+    echohl ErrorMsg
+    echom "Claude: Empty response received for implementation"
+    echohl None
+    unlet s:implement_response
+    return
+  endif
+
   call win_gotoid(a:winid)
 
   call s:LogImplementInChat(a:instruction, s:implement_response, a:bufname, a:line1, a:line2)
 
   let l:implemented_code = s:ExtractCodeFromMarkdown(s:implement_response)
-
-  let l:changes = [{
-    \ 'type': 'content',
-    \ 'normal_command': a:line1 . 'GV' . a:line2 . 'Gc',
-    \ 'content': l:implemented_code
-    \ }]
-  call s:ApplyCodeChangesDiff(a:bufnr, l:changes)
-
-  echomsg "Apply diff, see :help diffget. Close diff buffer with :q."
+  
+  if empty(l:implemented_code)
+    echohl WarningMsg
+    echom "Claude: No code blocks found in response. Check Claude Chat buffer for raw response."
+    echohl None
+  else
+    let l:changes = [{
+      \ 'type': 'content',
+      \ 'normal_command': a:line1 . 'GV' . a:line2 . 'Gc',
+      \ 'content': l:implemented_code
+      \ }]
+    call s:ApplyCodeChangesDiff(a:bufnr, l:changes)
+    echomsg "Apply diff, see :help diffget. Close diff buffer with :q."
+  endif
 
   unlet s:implement_response
   unlet! s:current_chat_job
@@ -1028,9 +1202,11 @@ function! s:AddMessageToList(messages, message)
 endfunction
 
 function! s:InitMessage(role, line)
+  " Extract content after "You:" or "Claude:" etc.
+  let l:content = substitute(a:line, '^[^:]*:\s*', '', '')
   return {
     \ 'role': a:role,
-    \ 'content': [substitute(a:line, '^\S*\s*', '', '')],
+    \ 'content': [l:content],
     \ 'tool_use': {},
     \ 'tool_result': {}
   \ }
@@ -1109,6 +1285,10 @@ function! s:ParseChatBuffer()
   let l:current_message = {'role': '', 'content': [], 'tool_use': {}, 'tool_result': {}}
   let l:system_prompt = []
   let l:in_system_prompt = 0
+  
+  if g:claude_verbose
+    call s:DebugLog("Parsing " . len(l:buffer_content) . " lines from chat buffer")
+  endif
 
   for line in l:buffer_content
     if line =~ '^System prompt:'
@@ -1118,12 +1298,22 @@ function! s:ParseChatBuffer()
       call add(l:system_prompt, substitute(line, '^\s*', '', ''))
     else
       let l:in_system_prompt = 0
+      if g:claude_verbose && line =~ '^You:'
+        call s:DebugLog("Found You: line: " . line)
+      endif
       let l:current_message = s:ProcessLine(line, l:messages, l:current_message)
     endif
   endfor
 
   if !empty(l:current_message.role)
     call s:AddMessageToList(l:messages, l:current_message)
+  endif
+  
+  if g:claude_verbose
+    call s:DebugLog("Parsed " . len(l:messages) . " messages from buffer")
+    for msg in l:messages
+      call s:DebugLog("Message role: " . msg.role . ", content length: " . len(string(msg.content)))
+    endfor
   endif
 
   return [filter(l:messages, {_, v -> !empty(v.content)}), join(l:system_prompt, "\n")]
@@ -1145,7 +1335,24 @@ function! s:GetBuffersContent()
 endfunction
 
 function! s:SendChatMessage(prefix)
+  if g:claude_verbose
+    echom "Claude: Parsing chat buffer..."
+    call s:DebugLog("Current buffer content (last 5 lines):")
+    for line in getline(line('$')-4, '$')
+      call s:DebugLog("  > " . line)
+    endfor
+  endif
+  
   let [l:messages, l:system_prompt] = s:ParseChatBuffer()
+  
+  if g:claude_verbose
+    echom "Claude: Found " . len(l:messages) . " messages"
+    if empty(l:messages)
+      echohl WarningMsg
+      echom "Claude: WARNING - No messages found! Make sure your message is on the same line as 'You: '"
+      echohl None
+    endif
+  endif
 
   let l:tool_uses = s:ResponseExtractToolUses(l:messages)
   if !empty(l:tool_uses)
@@ -1167,6 +1374,10 @@ function! s:SendChatMessage(prefix)
   call append('$', a:prefix . " ")
   normal! G
 
+  if g:claude_verbose
+    echom "Claude: Sending query to API/CLI..."
+  endif
+  
   let l:job = s:ClaudeQueryInternal(l:messages, l:content_prompt . l:system_prompt, g:claude_tools, function('s:StreamingChatResponse'), function('s:FinalChatResponse'))
 
   " Store the job ID or channel for potential cancellation
@@ -1360,6 +1571,13 @@ endfunction
 
 function! s:StreamingChatResponse(delta)
   let [l:chat_bufnr, l:chat_winid, l:current_winid] = s:GetOrCreateChatWindow()
+  
+  " Check if window exists
+  if l:chat_winid == -1
+    call s:DebugLog("ERROR: Chat window not found while streaming response")
+    return
+  endif
+  
   call win_gotoid(l:chat_winid)
 
   let l:indent = s:GetClaudeIndent()
@@ -1368,12 +1586,24 @@ function! s:StreamingChatResponse(delta)
   if len(l:new_lines) > 0
     " Update the last line with the first segment of the delta
     let l:last_line = getline('$')
-    call setline('$', l:last_line . l:new_lines[0])
+    
+    " Check if we're starting a new response or continuing
+    if l:last_line =~ '^Claude:\s*$'
+      " Starting fresh - append after "Claude: "
+      call setline('$', 'Claude: ' . l:new_lines[0])
+    else
+      " Continuing - append to existing line
+      call setline('$', l:last_line . l:new_lines[0])
+    endif
 
-    call append('$', map(l:new_lines[1:], {_, v -> l:indent . v}))
+    " Add remaining lines with proper indentation
+    if len(l:new_lines) > 1
+      call append('$', map(l:new_lines[1:], {_, v -> v =~ '^\s*$' ? '' : l:indent . v}))
+    endif
   endif
 
   normal! G
+  redraw
   call win_gotoid(l:current_winid)
 endfunction
 
@@ -1445,6 +1675,7 @@ function! s:OpenDebugBuffer()
   call append('$', '--- Configuration ---')
   call append('$', 'claude_code_cli: ' . g:claude_code_cli)
   call append('$', 'CLI executable: ' . (executable(g:claude_code_cli) ? 'Yes' : 'No'))
+  call append('$', 'claude_verbose: ' . g:claude_verbose)
   call append('$', 'claude_use_bedrock: ' . g:claude_use_bedrock)
   call append('$', 'claude_model: ' . g:claude_model)
   call append('$', 'API key set: ' . (!empty(g:claude_api_key) ? 'Yes' : 'No'))
